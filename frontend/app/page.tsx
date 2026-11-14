@@ -246,7 +246,7 @@ export default function LandingPage() {
             </Link>
 
             <a
-              href="https://github.com/CaSh007s/signal-forge"
+              href="https://github.com/MeAkash77/SignalForge-AI----Recruitment-Intelligence-Automated-Market-Mapping.git"
               target="_blank"
               rel="noopener noreferrer"
               className="w-full"
