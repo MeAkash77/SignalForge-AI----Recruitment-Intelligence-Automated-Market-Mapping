@@ -3,6 +3,7 @@ aiohttp
 aiosignal
 annotated-doc
 annotated-types
+psycopg[binary]
 anyio
 attrs
 bcrypt
