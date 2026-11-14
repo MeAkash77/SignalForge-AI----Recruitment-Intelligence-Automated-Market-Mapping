@@ -1,0 +1,292 @@
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from typing import Any, List, Dict, Optional
+from app.agent.graph import app as agent_app
+from app.services.finance import get_stock_history
+from app.services.cache import CacheService
+from app import schemas, models
+from app.db import get_db
+from app.auth_utils import get_current_user
+from app.services.finance import convert_chart_data
+from app.services.gemini_resolver import resolve_gemini_key
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+router = APIRouter()
+
+# --- Request Models ---
+class QueryRequest(BaseModel):
+    query: str
+    force_regenerate: bool = False
+
+class AnalysisResponse(BaseModel):
+    id: Optional[int] = None
+    company_name: str
+    report_content: str
+    chart_data: Optional[Dict[str, Any]] = None
+    sentiment_score: Optional[int] = None
+
+# --- Helpers ---
+def parse_agent_response(content: Any) -> str:
+    if isinstance(content, str): return content
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif hasattr(block, "text"):
+                text_parts.append(block.text)
+        return "\n".join(text_parts)
+    return str(content)
+
+def resolve_ticker(query: str, api_key: str) -> str:
+    """Uses Gemini to identify the exact stock ticker or return INVALID for gibberish."""
+    try:
+        # We use a fast, deterministic model for quick parsing
+        llm = ChatGoogleGenerativeAI(model="gemini-3.8-flash", api_key=api_key, temperature=0.0)
+        prompt = f"The user entered: '{query}'. Reply with ONLY the official, currently active stock ticker symbol (e.g., AAPL). For Indian stocks, append .NS or .BO (e.g., RELIANCE.NS, TATAMOTORS.NS). Be aware of recent corporate name changes (e.g., if they ask for Zomato, return ETERNAL.NS). If the company is not publicly traded, delisted, or the query is gibberish/irrelevant, reply with ONLY the exact word 'INVALID'. Do not include any other text."
+        res = llm.invoke(prompt)
+        return res.content.strip().upper()
+    except Exception as e:
+        print(f"Ticker resolution failed: {e}")
+        return "INVALID"
+
+# --- Endpoints ---
+
+@router.post("/analyze", response_model=AnalysisResponse)
+async def analyze_company(
+    request: QueryRequest, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    try:
+        # 1. Resolve User API Key First
+        api_key = resolve_gemini_key(current_user)
+        if not api_key:
+            raise HTTPException(status_code=428, detail="Bring Your Own Key (BYOK) required.")
+
+        # 2. Extract Official Ticker via LLM
+        query_key = resolve_ticker(request.query, api_key)
+        
+        if query_key == "INVALID":
+            raise HTTPException(status_code=400, detail="Could not identify a publicly traded company from that query.")
+            
+        cache_key = f"report:{query_key}"
+
+        # 3. CHECK CACHE (Fast Path)
+        if not request.force_regenerate:
+            cached_data = CacheService.get(cache_key)
+            if cached_data:
+                print(f"⚡ CACHE HIT: {query_key}")
+                return cached_data
+        else:
+            print(f"🔄 FORCING REGENERATION: {query_key}")
+
+        # 3.5 CHECK API LIMITS
+        from app.services.gemini_resolver import is_admin_email
+        daily_usage = CacheService.get_daily_usage(current_user.id)
+        if daily_usage >= 3 and not is_admin_email(current_user.email):
+            print(f"🛑 RATE LIMIT BLOCKED FOR USER: {current_user.id}")
+            raise HTTPException(status_code=429, detail="You have reached your 3 reports per day limit.")
+
+        print(f"🐢 CACHE MISS: {query_key} -> Running Agent...")
+
+        # 4. RUN AGENT (Slow Path)
+        global_curr = getattr(current_user, "global_currency", "USD")
+        initial_state = {
+            "messages": [("user", f"Analyze this company/ticker: {query_key}")], 
+            "api_key": api_key,
+            "global_currency": global_curr
+        }
+        result = await agent_app.ainvoke(initial_state)
+        raw_content = result["messages"][-1].content
+        report_text_raw = parse_agent_response(raw_content)
+        
+        import json
+        import re
+        
+        sentiment_score = 50
+        report_text = report_text_raw
+
+        try:
+            cleaned = report_text_raw.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:-3].strip()
+            elif cleaned.startswith("```"):
+                cleaned = cleaned[3:-3].strip()
+                
+            start_idx = cleaned.find("{")
+            end_idx = cleaned.rfind("}")
+            
+            if start_idx != -1 and end_idx != -1:
+                cleaned = cleaned[start_idx:end_idx+1]
+                
+            try:
+                parsed = json.loads(cleaned)
+                sentiment_score = parsed.get("score", 50)
+                report_text = parsed.get("markdown", report_text_raw)
+            except json.JSONDecodeError:
+                # Fallback: LLM generated invalid JSON (likely unescaped newlines in markdown string)
+                print(f"Native JSON parse failed. Engaging Regex Regex Extraction Fallback.")
+                score_match = re.search(r'"score"\s*:\s*(\d+)', cleaned)
+                if score_match:
+                    sentiment_score = int(score_match.group(1))
+                
+                markdown_match = re.search(r'"markdown"\s*:\s*"(.*)"\s*\}\s*$', cleaned, re.DOTALL)
+                if markdown_match:
+                    extracted_text = markdown_match.group(1)
+                    # Replace escaped quotes back to normal quotes if LLM attempted partial escaping
+                    report_text = extracted_text.replace('\\"', '"')
+        except Exception as parse_e:
+            print(f"Total failure parsing report: {parse_e}")
+        
+        # 5. FETCH VISUALS
+        try:
+            chart_data = get_stock_history(query_key, global_curr)
+        except Exception as e:
+            print(f"Chart fetch error: {e}")
+            chart_data = None
+
+        # 6. SAVE TO DATABASE (Persistent Memory)
+        db_report = db.query(models.Report).filter(
+            models.Report.company_name == query_key,
+            models.Report.owner_id == current_user.id
+        ).first()
+
+        if db_report:
+            db_report.report_content = report_text
+            db_report.chart_data = chart_data
+            db_report.sentiment_score = sentiment_score
+        else:
+            db_report = models.Report(
+                company_name=query_key,
+                report_content=report_text,
+                chart_data=chart_data,
+                sentiment_score=sentiment_score,
+                owner_id=current_user.id
+            )
+            db.add(db_report)
+            
+        db.commit()
+        db.refresh(db_report)
+        
+        # 6.5 INCREMENT DAILY LIMIT AFTER SUCCESS
+        CacheService.increment_daily_usage(current_user.id)
+
+        # 7. CONSTRUCT RESPONSE
+        response_data = {
+            "id": db_report.id,
+            "company_name": query_key,
+            "report_content": report_text,
+            "chart_data": chart_data,
+            "sentiment_score": sentiment_score
+        }
+
+        # 8. SAVE TO CACHE (12 Hour TTL)
+        CacheService.set(cache_key, response_data, expire_seconds=43200)
+
+        return response_data
+
+    except HTTPException as http_exc:
+        # Re-raise the HTTP exception specifically so the 428 bypasses the generic catch
+        raise http_exc
+    except Exception as e:
+        error_str = str(e).lower()
+        print(f"Error in analysis: {error_str}")
+        
+        # Check for invalid key, quota exhaustion, or other generative AI auth errors
+        if any(keyword in error_str for keyword in [
+            "api key not valid", "api_key_invalid", "quota", "429", "exhausted", "403", "401"
+        ]):
+            # The saved key was invalid or exhausted. Delete it so the user is prompted again.
+            from app.services.supabase_client import delete_user_gemini_key
+            if hasattr(current_user, "supabase_uid") and current_user.supabase_uid:
+                delete_user_gemini_key(current_user.supabase_uid)
+            raise HTTPException(status_code=428, detail="Key invalid or exhausted. Please provide a new API key.")
+            
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/reports", response_model=List[schemas.ReportResponse])
+def get_user_reports(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Fetch all reports generated by the logged-in user."""
+    reports = db.query(models.Report).filter(models.Report.owner_id == current_user.id).order_by(models.Report.created_at.desc()).all()
+    
+    # Process chart data conversions based on user's current preferences
+    user_currency = getattr(current_user, "global_currency", "USD")
+    for report in reports:
+        if report.chart_data and report.chart_data.get("currency") != user_currency:
+            converted = convert_chart_data(report.chart_data, user_currency)
+            # Update DB (optional, but good for subsequent reads and dashboard performance)
+            report.chart_data = converted
+            db.commit()
+    return reports
+
+@router.delete("/reports/{report_id}")
+def delete_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Delete a specific report."""
+    report = db.query(models.Report).filter(models.Report.id == report_id, models.Report.owner_id == current_user.id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    
+    # Clean up the Redis Cache so it forces a fresh regeneration next time
+    CacheService.delete(f"report:{report.company_name}")
+    
+    db.delete(report)
+    db.commit()
+    return {"status": "deleted", "id": report_id}
+
+@router.get("/reports/{report_id}", response_model=schemas.ReportResponse)
+def get_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Fetch a single report by ID."""
+    report = db.query(models.Report).filter(
+        models.Report.id == report_id, 
+        models.Report.owner_id == current_user.id
+    ).first()
+    
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+        
+    user_currency = getattr(current_user, "global_currency", "USD")
+    if report.chart_data and report.chart_data.get("currency") != user_currency:
+        converted = convert_chart_data(report.chart_data, user_currency)
+        report.chart_data = converted
+        db.commit()
+        
+    return report
+
+@router.get("/reports/{report_id}/chart", response_model=Dict[str, Any])
+def get_report_chart(
+    report_id: int,
+    timeframe: str = "3M",
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Fetch an on-demand chart for an existing report with a dynamically requested timeframe."""
+    report = db.query(models.Report).filter(
+        models.Report.id == report_id, 
+        models.Report.owner_id == current_user.id
+    ).first()
+    
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+        
+    global_curr = getattr(current_user, "global_currency", "USD")
+    chart_data = get_stock_history(report.company_name, global_curr, timeframe)
+    
+    if not chart_data:
+        raise HTTPException(status_code=500, detail="Failed to fetch chart data from financial provider.")
+        
+    # Technically we don't *have* to persist toggled timeframe views to the DB, 
+    # but we will just return it directly so the UI can swap it instantly.
+    return chart_data

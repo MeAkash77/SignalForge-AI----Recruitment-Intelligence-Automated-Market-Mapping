@@ -1,0 +1,159 @@
+import os
+import requests
+from datetime import datetime, timedelta
+from app.services.cache import CacheService
+
+def get_conversion_rate(base: str, target: str) -> float:
+    if base == target: return 1.0
+    
+    cache_key = f"forex:{base}:{target}"
+    cached_rate = CacheService.get(cache_key)
+    if cached_rate:
+        return float(cached_rate)
+
+    try:
+        import yfinance as yf
+        pair = f"{base}{target}=X"
+        hist = yf.Ticker(pair).history(period="1d")
+        if not hist.empty:
+            rate = float(hist['Close'].iloc[-1])
+            # Cache the rate for 24 hours (86400 seconds) to avoid API limits
+            CacheService.set(cache_key, rate, expire_seconds=86400)
+            return rate
+    except Exception as e:
+        print(f"Forex error {base}->{target}: {e}")
+    
+    return 1.0
+
+def convert_chart_data(chart_data: dict, target_currency: str) -> dict:
+    """Converts a chart_data dictionary to a new target_currency."""
+    if not chart_data or chart_data.get("currency") == target_currency:
+        return chart_data
+        
+    base_currency = chart_data.get("currency", "USD")
+    rate = get_conversion_rate(base_currency, target_currency)
+    
+    if rate == 1.0 and base_currency != target_currency:
+        # If conversion fails and returns 1.0 but currencies are different, 
+        # we might want to log it or handle it, but for now we just return the original.
+        pass
+        
+    new_history = []
+    for item in chart_data.get("history", []):
+        new_history.append({
+            "date": item["date"],
+            "price": round(item["price"] * rate, 2)
+        })
+        
+    new_chart_data = chart_data.copy()
+    new_chart_data["currency"] = target_currency
+    new_chart_data["history"] = new_history
+    
+    return new_chart_data
+
+def get_stock_history(query: str, target_currency: str = "USD", timeframe: str = "3M"):
+    """
+    Attempts to find a ticker from the query and returns 3mo daily data from Alpaca/Yfinance,
+    converting to the target_currency.
+    """
+    try:
+        ticker_symbol = query.upper().strip()
+        data = []
+        base_currency = "USD"
+        
+        # 1. Global Market Fallback (yfinance)
+        if "." in ticker_symbol:
+            import yfinance as yf
+            ticker = yf.Ticker(ticker_symbol)
+            # Map frontend timeframe to yfinance period
+            yf_period = {"1M": "1mo", "3M": "3mo", "1Y": "1y", "5Y": "5y"}.get(timeframe, "3mo")
+            hist = ticker.history(period=yf_period)
+            
+            if hist.empty:
+                print(f"yfinance found no data for {ticker_symbol}")
+                return None
+                
+            data = []
+            for date, row in hist.iterrows():
+                data.append({
+                    "date": date.strftime('%Y-%m-%d'),
+                    "price": round(row['Close'], 2)
+                })
+                
+            if ticker_symbol.endswith(".NS") or ticker_symbol.endswith(".BO"):
+                base_currency = "INR"
+            elif ticker_symbol.endswith(".L"):
+                base_currency = "GBP"
+            elif ticker_symbol.endswith(".TO"):
+                base_currency = "CAD"
+            
+            # Data populated via yfinance
+
+        else:
+            # 2. US Market Default (Alpaca)
+            api_key = os.getenv("ALPACA_API_KEY")
+            secret_key = os.getenv("ALPACA_SECRET_KEY")
+            
+            if not api_key or not secret_key:
+                print("Alpaca keys missing, returning None")
+                return None
+
+            headers = {
+                "APCA-API-KEY-ID": api_key,
+                "APCA-API-SECRET-KEY": secret_key,
+                "Accept": "application/json"
+            }
+
+            days_map = {"1M": 30, "3M": 90, "1Y": 365, "5Y": 1825}
+            days = days_map.get(timeframe, 90)
+
+            end_dt = datetime.utcnow()
+            start_dt = end_dt - timedelta(days=days)
+            
+            start_str = start_dt.strftime('%Y-%m-%dT00:00:00Z')
+            end_str = end_dt.strftime('%Y-%m-%dT23:59:59Z')
+
+            url = f"https://data.alpaca.markets/v2/stocks/{ticker_symbol}/bars"
+            params = {
+                "timeframe": "1Day",
+                "start": start_str,
+                "end": end_str,
+                "limit": 10000,
+                "adjustment": "split",
+                "feed": "iex"
+            }
+
+            res = requests.get(url, headers=headers, params=params)
+            if res.status_code != 200:
+                print("Alpaca Error:", res.text)
+                return None
+                
+            json_data = res.json()
+            bars = json_data.get("bars", [])
+            
+            if not bars:
+                return None
+
+            for bar in bars:
+                # Alpaca timestamp looks like 2024-01-02T05:00:00Z
+                bar_date = datetime.strptime(bar['t'][:10], '%Y-%m-%d').strftime('%Y-%m-%d')
+                data.append({
+                    "date": bar_date,
+                    "price": round(bar['c'], 2)
+                })
+
+        # 3. Apply Multiplier
+        rate = get_conversion_rate(base_currency, target_currency)
+        if rate != 1.0:
+            for item in data:
+                item["price"] = round(item["price"] * rate, 2)
+                
+        return {
+            "symbol": ticker_symbol,
+            "currency": target_currency,
+            "history": data
+        }
+
+    except Exception as e:
+        print(f"Error fetching stock data from Alpaca: {e}")
+        return None

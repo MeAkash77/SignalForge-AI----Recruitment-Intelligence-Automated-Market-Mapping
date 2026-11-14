@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+@plugin "tailwindcss-animate";
+@plugin "@tailwindcss/typography";
+
+@layer base {
+  :root {
+    --bg: 0 0% 98%; /* Zinc-50 */
+    --surface: 0 0% 100%; /* White */
+    --surface-elevated: 240 5% 96%; /* Zinc-100 */
+    --border: 240 5.9% 90%; /* Zinc-200 */
+
+    --text-primary: 240 10% 3.9%; /* Zinc-950 */
+    --text-secondary: 240 3.8% 46.1%; /* Zinc-500 */
+    --text-muted: 240 5% 64.9%; /* Zinc-400 */
+
+    --accent: 142.1 76.2% 36.3%; /* Emerald-600 */
+    --accent-hover: 142.1 70.6% 45.3%; /* Emerald-500 */
+
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    --bg: 240 10% 3.9%; /* Zinc-950 */
+    --surface: 240 5.9% 10%; /* Zinc-900 */
+    --surface-elevated: 240 3.7% 15.9%; /* Zinc-800 */
+    --border: 240 3.7% 15.9%; /* Zinc-800 */
+
+    --text-primary: 0 0% 98%; /* White */
+    --text-secondary: 240 5% 64.9%; /* Zinc-400 */
+    --text-muted: 240 3.7% 15.9%; /* Zinc-800 */
+
+    --accent: 142.1 70.6% 45.3%; /* Emerald-500 */
+    --accent-hover: 142.4 71.8% 29.2%; /* Emerald-600 */
+  }
+}
+
+@layer base {
+  * {
+    /* ✅ FIX: Use native CSS to stop the 'unknown utility class' crash */
+    border-color: hsl(var(--border));
+  }
+  body {
+    background-color: hsl(var(--bg));
+    color: hsl(var(--text-primary));
+  }
+}
+
+/* Print Overrides: Ensure PDF sees clean white background */
+@media print {
+  body {
+    background: white;
+    color: black;
+  }
+}
